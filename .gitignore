@@ -1,0 +1,10 @@
+node_modules/
+out/
+dist/
+*.bin
+teste/
+bin/
+.vscode/
+*.log
+test-*.js
+PLAN.md
