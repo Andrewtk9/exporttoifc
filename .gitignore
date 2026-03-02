@@ -1,10 +1,10 @@
 node_modules/
 out/
 dist/
-*.bin
+
+# Large test/output files (multi-GB)
 teste/
 bin/
-.vscode/
-*.log
-test-*.js
-PLAN.md
+*.ifc
+*.nwc
+*.bin
