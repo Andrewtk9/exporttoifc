@@ -17,10 +17,23 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('convert:progress', handler)
     return () => ipcRenderer.removeListener('convert:progress', handler)
   },
+  onOptimizeProgress: (callback: (data: { message: string; percent: number }) => void) => {
+    const handler = (_event: any, data: { message: string; percent: number }) => callback(data)
+    ipcRenderer.on('optimize:progress', handler)
+    return () => ipcRenderer.removeListener('optimize:progress', handler)
+  },
+  onScanProgress: (callback: (data: { message: string; percent: number }) => void) => {
+    const handler = (_event: any, data: { message: string; percent: number }) => callback(data)
+    ipcRenderer.on('scan:progress', handler)
+    return () => ipcRenderer.removeListener('scan:progress', handler)
+  },
   saveDialog: () => ipcRenderer.invoke('file:save-dialog'),
   saveFile: (filePath: string, data: Uint8Array) =>
     ipcRenderer.invoke('file:save', filePath, data),
   convertToIfc: (options: any) => ipcRenderer.invoke('convert:to-ifc', options),
+  openIfcDialog: () => ipcRenderer.invoke('file:open-ifc-dialog'),
+  scanCategories: (filePath: string) => ipcRenderer.invoke('scan:categories', filePath),
+  optimizeIfc: (options: any) => ipcRenderer.invoke('optimize:ifc', options),
   saveState: () => ipcRenderer.invoke('state:save'),
   loadState: () => ipcRenderer.invoke('state:load')
 })

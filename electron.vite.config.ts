@@ -10,7 +10,8 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: path.resolve(__dirname, 'src/main/index.ts'),
-          'parser-worker': path.resolve(__dirname, 'src/main/parser-worker.ts')
+          'parser-worker': path.resolve(__dirname, 'src/main/parser-worker.ts'),
+          'optimize-worker': path.resolve(__dirname, 'src/main/optimize-worker.ts')
         }
       }
     }

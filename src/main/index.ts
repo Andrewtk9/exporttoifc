@@ -1,9 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import path from 'path'
 import fs from 'fs'
+import { fork } from 'child_process'
 import { convertToIfc } from './converter'
 import { parseFileFromDisk, ParseResult } from './parser'
 import { MeshStoreReader } from './mesh-store'
+import { optimizeMeshes } from './optimizer'
+import { scanIfcCategories } from './ifc-scanner'
 
 let mainWindow: BrowserWindow | null = null
 let currentParseResult: ParseResult | null = null
@@ -199,11 +202,13 @@ ipcMain.handle('state:load', async () => {
   }
 })
 
+// ---- Convert 3D → IFC (with optional optimization) ----
 ipcMain.handle('convert:to-ifc', async (_event, options: {
   projectName: string
   siteName: string
   buildingName: string
   storeyName: string
+  optimization?: string
 }) => {
   try {
     if (!currentParseResult?.tempFile) {
@@ -221,28 +226,198 @@ ipcMain.handle('convert:to-ifc', async (_event, options: {
       return { success: false, canceled: true }
     }
 
+    const optimizationLevel = (options.optimization || 'none') as 'none' | 'light' | 'medium' | 'aggressive'
+    let tempFileToUse = currentParseResult.tempFile
+    let meshCountToUse = currentParseResult.meshCount
+    let optimizationStats: any = null
+    let optimizedTempFile: string | null = null
+
+    // Run optimization if requested
+    if (optimizationLevel !== 'none') {
+      mainWindow?.webContents.send('convert:progress', {
+        message: 'Otimizando meshes...',
+        percent: 1
+      })
+
+      const optResult = await optimizeMeshes(
+        currentParseResult.tempFile,
+        currentParseResult.meshCount,
+        {
+          level: optimizationLevel,
+          onProgress: (message, percent) => {
+            // Scale optimization progress to 0-50% of total
+            const scaledPercent = Math.round(percent * 0.5)
+            mainWindow?.webContents.send('convert:progress', { message, percent: scaledPercent })
+          }
+        }
+      )
+
+      tempFileToUse = optResult.tempFile
+      meshCountToUse = optResult.meshCount
+      optimizedTempFile = optResult.tempFile !== currentParseResult.tempFile ? optResult.tempFile : null
+
+      optimizationStats = {
+        originalVertices: optResult.originalVertices,
+        originalFaces: optResult.originalFaces,
+        optimizedVertices: optResult.totalVertices,
+        optimizedFaces: optResult.totalFaces,
+        meshesBeforeOptimization: currentParseResult.meshCount,
+        meshesAfterOptimization: optResult.meshCount
+      }
+    }
+
     mainWindow?.webContents.send('convert:progress', {
-      message: 'Iniciando conversao...',
-      percent: 1
+      message: 'Gerando arquivo IFC...',
+      percent: optimizationLevel !== 'none' ? 52 : 1
     })
 
     // Convert and write directly to file (streaming, no memory buffer)
     await convertToIfc({
-      tempFile: currentParseResult.tempFile,
-      meshCount: currentParseResult.meshCount,
+      tempFile: tempFileToUse,
+      meshCount: meshCountToUse,
       outputPath: saveResult.filePath,
-      ...options,
+      projectName: options.projectName,
+      siteName: options.siteName,
+      buildingName: options.buildingName,
+      storeyName: options.storeyName,
       onProgress: (message, percent) => {
-        mainWindow?.webContents.send('convert:progress', { message, percent })
+        // Scale conversion progress to 50-100% if optimized, or 0-100% if not
+        const scaledPercent = optimizationLevel !== 'none'
+          ? 52 + Math.round(percent * 0.48)
+          : percent
+        mainWindow?.webContents.send('convert:progress', { message, percent: scaledPercent })
       }
     })
+
+    // Clean up optimized temp file
+    if (optimizedTempFile) {
+      try { fs.unlinkSync(optimizedTempFile) } catch {}
+    }
 
     mainWindow?.webContents.send('convert:progress', {
       message: 'Concluido!',
       percent: 100
     })
 
-    return { success: true }
+    return { success: true, optimizationStats }
+  } catch (error: any) {
+    return { success: false, error: error.message }
+  }
+})
+
+// ---- Scan IFC categories (fast, runs in main process) ----
+ipcMain.handle('scan:categories', async (_event, filePath: string) => {
+  try {
+    const result = await scanIfcCategories(filePath, (message, percent) => {
+      mainWindow?.webContents.send('scan:progress', { message, percent })
+    })
+    // Convert Map to serializable array for IPC
+    const faceSetMapping: [number, string][] = []
+    for (const [fsId, cat] of result.faceSetToCategory) {
+      faceSetMapping.push([fsId, cat])
+    }
+    return {
+      success: true,
+      categories: result.categories,
+      faceSetMapping
+    }
+  } catch (error: any) {
+    return { success: false, error: error.message }
+  }
+})
+
+// ---- Open IFC file dialog (for optimize mode) ----
+ipcMain.handle('file:open-ifc-dialog', async () => {
+  const result = await dialog.showOpenDialog(mainWindow!, {
+    title: 'Selecionar arquivo IFC para otimizar',
+    filters: [
+      { name: 'IFC Files', extensions: ['ifc'] },
+      { name: 'Todos os arquivos', extensions: ['*'] }
+    ],
+    properties: ['openFile']
+  })
+  if (result.canceled || result.filePaths.length === 0) return null
+  return result.filePaths[0]
+})
+
+// ---- Optimize existing IFC file (runs in child process with 8GB heap) ----
+ipcMain.handle('optimize:ifc', async (_event, options: {
+  inputPath: string
+  level: string
+  excludedCategories?: string[]
+}) => {
+  try {
+    const inputPath = options.inputPath
+    const inputName = path.basename(inputPath, '.ifc')
+
+    // Ask where to save the optimized file
+    const saveResult = await dialog.showSaveDialog(mainWindow!, {
+      title: 'Salvar IFC otimizado',
+      defaultPath: `${inputName}_otimizado.ifc`,
+      filters: [{ name: 'IFC Files', extensions: ['ifc'] }]
+    })
+
+    if (!saveResult.filePath) {
+      return { success: false, canceled: true }
+    }
+
+    const level = (options.level || 'medium') as 'none' | 'light' | 'medium' | 'aggressive'
+
+    // Run the heavy pipeline in a child process with 8GB heap
+    const workerPath = path.join(__dirname, 'optimize-worker.js')
+
+    return await new Promise((resolve) => {
+      const child = fork(workerPath, [], {
+        execArgv: ['--max-old-space-size=8192'],
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+      })
+
+      child.on('message', (msg: any) => {
+        if (msg.type === 'progress') {
+          mainWindow?.webContents.send('optimize:progress', {
+            message: msg.message,
+            percent: msg.percent
+          })
+        } else if (msg.type === 'done') {
+          mainWindow?.webContents.send('optimize:progress', {
+            message: 'Otimizado com sucesso!',
+            percent: 100
+          })
+          resolve({ success: true, stats: msg.stats })
+        } else if (msg.type === 'error') {
+          resolve({ success: false, error: msg.message })
+        } else if (msg.type === 'ready') {
+          // Worker is ready, send the start command
+          child.send({
+            type: 'start',
+            inputPath,
+            outputPath: saveResult.filePath,
+            level,
+            projectName: inputName,
+            siteName: 'Site',
+            buildingName: 'Edificio',
+            storeyName: 'Pavimento',
+            excludedCategories: options.excludedCategories || []
+          })
+        }
+      })
+
+      child.on('error', (err) => {
+        resolve({ success: false, error: `Worker error: ${err.message}` })
+      })
+
+      child.on('exit', (code) => {
+        if (code !== 0 && code !== null) {
+          resolve({ success: false, error: `Worker exited with code ${code} (possivelmente falta de memoria)` })
+        }
+      })
+
+      // Forward stderr for debugging
+      child.stderr?.on('data', (data: Buffer) => {
+        const text = data.toString().trim()
+        if (text) console.error('[optimize-worker]', text)
+      })
+    })
   } catch (error: any) {
     return { success: false, error: error.message }
   }
